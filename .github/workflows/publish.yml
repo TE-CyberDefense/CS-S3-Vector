@@ -83,9 +83,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04-8core
+            runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-8core-arm
+            runner: ubuntu-latest-arm
     steps:
       - name: Install system dependencies
         run: |
@@ -177,57 +177,57 @@ jobs:
           name: vector-${{ env.VECTOR_VERSION }}-${{ matrix.target }}
           path: target/artifacts/vector*
 
-  build-apple-darwin-packages:
-    name: Build Vector for ${{ matrix.architecture }}-apple-darwin (.tar.gz)
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    needs: generate-publish-metadata
-    env:
-      VECTOR_VERSION: ${{ needs.generate-publish-metadata.outputs.vector_version }}
-      VECTOR_BUILD_DESC: ${{ needs.generate-publish-metadata.outputs.vector_build_desc }}
-      CHANNEL: ${{ needs.generate-publish-metadata.outputs.vector_release_channel }}
-    strategy:
-      matrix:
-        include:
-          # Refer to https://docs.github.com/en/actions/using-github-hosted-runners/using-larger-runners/about-larger-runners#about-macos-larger-runners.
-          # and to https://github.com/actions/runner-images
-          - architecture: arm64
-            runner: macos-14-xlarge
-    steps:
-      - name: Verify Runner Architecture
-        run: |
-          ARCH=$(uname -m)
-          echo "Detected architecture: $ARCH"
-          if [ "$ARCH" != "${{ matrix.architecture }}" ]; then
-            echo "Error: Expected ${{ matrix.architecture }} architecture, but got $ARCH!"
-            exit 1
-          fi
-      - name: Checkout Vector
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ inputs.git_ref }}
-
-      - uses: ./.github/actions/setup
-        with:
-          rust: true
-          protoc: true
-      - name: Build Vector
-        env:
-          TARGET: "${{ matrix.architecture }}-apple-darwin"
-          NATIVE_BUILD: true
-          FEATURES: "target-aarch64-apple-darwin"
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          make package
-      - name: Stage package artifacts for publish
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: vector-${{ env.VECTOR_VERSION }}-${{ matrix.architecture }}-apple-darwin
-          path: target/artifacts/vector*
+#  build-apple-darwin-packages:
+#    name: Build Vector for ${{ matrix.architecture }}-apple-darwin (.tar.gz)
+#    runs-on: ${{ matrix.runner }}
+#    timeout-minutes: 90
+#    needs: generate-publish-metadata
+#    env:
+#      VECTOR_VERSION: ${{ needs.generate-publish-metadata.outputs.vector_version }}
+#      VECTOR_BUILD_DESC: ${{ needs.generate-publish-metadata.outputs.vector_build_desc }}
+#      CHANNEL: ${{ needs.generate-publish-metadata.outputs.vector_release_channel }}
+#    strategy:
+#      matrix:
+#        include:
+#          # Refer to https://docs.github.com/en/actions/using-github-hosted-runners/using-larger-runners/about-larger-runners#about-macos-larger-runners.
+#          # and to https://github.com/actions/runner-images
+#          - architecture: arm64
+#            runner: macos-14-xlarge
+#    steps:
+#      - name: Verify Runner Architecture
+#        run: |
+#          ARCH=$(uname -m)
+#          echo "Detected architecture: $ARCH"
+#          if [ "$ARCH" != "${{ matrix.architecture }}" ]; then
+#            echo "Error: Expected ${{ matrix.architecture }} architecture, but got $ARCH!"
+#            exit 1
+#          fi
+#      - name: Checkout Vector
+#        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+#        with:
+#          ref: ${{ inputs.git_ref }}
+#
+#      - uses: ./.github/actions/setup
+#        with:
+#          rust: true
+#          protoc: true
+#      - name: Build Vector
+#        env:
+#          TARGET: "${{ matrix.architecture }}-apple-darwin"
+#          NATIVE_BUILD: true
+#          FEATURES: "target-aarch64-apple-darwin"
+#        run: |
+#          export PATH="$HOME/.cargo/bin:$PATH"
+#          make package
+#      - name: Stage package artifacts for publish
+#        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#        with:
+#          name: vector-${{ env.VECTOR_VERSION }}-${{ matrix.architecture }}-apple-darwin
+#          path: target/artifacts/vector*
 
   build-x86_64-pc-windows-msvc-packages:
     name: Build Vector for x86_64-pc-windows-msvc (.zip)
-    runs-on: windows-2025-8core
+    runs-on: windows-2025
     timeout-minutes: 90
     needs: generate-publish-metadata
     env:
@@ -394,7 +394,7 @@ jobs:
     timeout-minutes: 5
     needs:
       - generate-publish-metadata
-      - build-apple-darwin-packages
+#      - build-apple-darwin-packages
     env:
       VECTOR_VERSION: ${{ needs.generate-publish-metadata.outputs.vector_version }}
     strategy:
@@ -489,7 +489,7 @@ jobs:
       - generate-publish-metadata
       - build-linux-gnu-native
       - build-linux-cross
-      - build-apple-darwin-packages
+#      - build-apple-darwin-packages
       - build-x86_64-pc-windows-msvc-packages
       - deb-verify
       - rpm-verify
@@ -531,7 +531,7 @@ jobs:
       - generate-publish-metadata
       - build-linux-gnu-native
       - build-linux-cross
-      - build-apple-darwin-packages
+      #      - build-apple-darwin-packages
       - build-x86_64-pc-windows-msvc-packages
       - deb-verify
       - rpm-verify
@@ -566,7 +566,7 @@ jobs:
       - generate-publish-metadata
       - build-linux-gnu-native
       - build-linux-cross
-      - build-apple-darwin-packages
+      #      - build-apple-darwin-packages
       - build-x86_64-pc-windows-msvc-packages
     env:
       VECTOR_VERSION: ${{ needs.generate-publish-metadata.outputs.vector_version }}
