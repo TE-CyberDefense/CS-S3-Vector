@@ -15,7 +15,7 @@ use aws_sdk_sqs::{
         receive_message::ReceiveMessageError,
         send_message_batch::{SendMessageBatchError, SendMessageBatchOutput},
     },
-    types::{DeleteMessageBatchRequestEntry, Message, MessageAttributeValue, SendMessageBatchRequestEntry, QueueAttributeName},
+    types::{DeleteMessageBatchRequestEntry, Message, MessageAttributeValue, MessageSystemAttributeName, SendMessageBatchRequestEntry},
 };
 use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
 use aws_types::region::Region;
@@ -50,9 +50,9 @@ use crate::{
     event::{BatchNotifier, BatchStatus, EstimatedJsonEncodedSizeOf, Event, LogEvent},
     internal_events::{
         EventsReceived, S3ObjectProcessingFailed, S3ObjectProcessingSucceeded,
-        SqsMessageDeleteBatchError, SqsMessageDeletePartialError, SqsMessageDeleteSucceeded,
+        SqsMessageDeletePartialError, SqsMessageDeleteSucceeded,
         SqsMessageProcessingError, SqsMessageProcessingSucceeded, SqsMessageReceiveError,
-        SqsMessageReceiveSucceeded, SqsMessageSendBatchError, SqsMessageSentPartialError,
+        SqsMessageReceiveSucceeded, SqsMessageSentPartialError,
         SqsMessageSentSucceeded, SqsS3EventRecordInvalidEventIgnored, StreamClosedError,
     },
     line_agg::{self, LineAgg},
@@ -534,7 +534,8 @@ impl IngestorProcess {
         }
 
         if !deferred_entries.is_empty() {
-            if let Some(deferred) = &self.state.deferred {
+            let deferred_url = self.state.deferred.as_ref().map(|d| d.queue_url.clone());
+            if let Some(deferred_url) = deferred_url {
                 for chunk in deferred_entries.chunks(10) {
                     let mut entries = Vec::new();
                     for (id, body) in chunk {
@@ -549,7 +550,7 @@ impl IngestorProcess {
                     }
 
                     if !entries.is_empty() {
-                        match self.send_messages(entries, deferred.queue_url.clone()).await {
+                        match self.send_messages(entries, deferred_url.clone()).await {
                             Ok(res) => {
                                 if !res.successful.is_empty() {
                                     for success in &res.successful {
@@ -576,6 +577,7 @@ impl IngestorProcess {
         }
 
         if !requeue_entries.is_empty() {
+            let queue_url = self.state.queue_url.clone();
             for chunk in requeue_entries.chunks(10) {
                 let mut entries = Vec::new();
                 for (id, body, next_retry) in chunk {
@@ -598,7 +600,7 @@ impl IngestorProcess {
                 }
 
                 if !entries.is_empty() {
-                    match self.send_messages(entries, self.state.queue_url.clone()).await {
+                    match self.send_messages(entries, queue_url.clone()).await {
                         Ok(res) => {
                             for success in res.successful {
                                 if let Some(entry) = tracker.get_mut(success.id.as_str()) {
@@ -821,10 +823,12 @@ impl IngestorProcess {
             let file_clone = file.clone();
 
             async move {
+                let bucket_err = bucket.clone();
+                let key_err = key.clone();
                 let fut = async move {
                     match process.process_file(
-                        bucket.clone(),
-                        key.clone(),
+                        bucket,
+                        key,
                         None,
                         sent_timestamp,
                         process.log_namespace,
@@ -841,11 +845,11 @@ impl IngestorProcess {
                         if join_err.is_panic() {
                             panic::resume_unwind(join_err.into_panic());
                         } else {
-                            tracing::error!(%bucket, %key, "S3 processing task was abruptly cancelled");
+                            tracing::error!(bucket = %bucket_err, key = %key_err, "S3 processing task was abruptly cancelled");
                             RecordStatus::Failed(file.clone(), ProcessingError::ErrorAcknowledgement {
                                 region: "unknown".to_string(),
-                                bucket,
-                                key,
+                                bucket: bucket_err,
+                                key: key_err,
                             })
                         }
                     }
@@ -1216,7 +1220,7 @@ impl IngestorProcess {
             .max_number_of_messages(self.state.max_number_of_messages)
             .visibility_timeout(self.state.visibility_timeout_secs)
             .wait_time_seconds(self.state.poll_secs)
-            .attribute_names(QueueAttributeName::All)
+            .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
             .message_attribute_names("VectorRetryCount")
             .send()
             .map_ok(|res| res.messages.unwrap_or_default())
