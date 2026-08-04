@@ -3,7 +3,7 @@ use std::{
     future::ready,
     num::NonZeroUsize,
     panic,
-    sync::{Arc, LazyLock},
+    sync::{atomic::{AtomicUsize, Ordering}, Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
 use tokio::{pin, select};
 use tokio_util::codec::FramedRead;
+use tracing::Instrument;
 use vector_lib::{
     codecs::decoding::FramingError,
     config::{LegacyKey, LogNamespace, log_schema},
@@ -357,7 +358,7 @@ impl Ingestor {
                 acknowledgements,
             );
             let fut = process.run();
-            let handle = crate::spawn_in_current_span(fut);
+            let handle = tokio::spawn(fut.in_current_span());
             handles.push(handle);
         }
 
@@ -409,52 +410,80 @@ impl IngestorProcess {
     async fn run(mut self) {
         let shutdown = self.shutdown.clone().fuse();
         pin!(shutdown);
+        
+        tracing::info!("SQS ingestor worker started. Ready to poll for new messages.");
 
         loop {
-            select! {
-                _ = &mut shutdown => break,
-                result = self.run_once() => {
+            // 1. Wait for EITHER a shutdown signal OR new messages from SQS
+            let messages = select! {
+                _ = &mut shutdown => {
+                    tracing::info!("Shutdown signal received for SQS worker. Stopping polling.");
+                    break;
+                },
+                result = self.receive_messages() => {
                     match result {
-                        Ok(()) => {
-                            // Reset backoff on successful receive
+                        Ok(messages) => {
+                            emit!(SqsMessageReceiveSucceeded {
+                                count: messages.len(),
+                            });
                             self.backoff.reset();
+                            messages
                         }
-                        Err(_) => {
+                        Err(err) => {
+                            emit!(SqsMessageReceiveError { error: &err });
                             let delay = self.backoff.next().expect("backoff never ends");
                             trace!(
                                 delay_ms = delay.as_millis(),
-                                "`run_once` failed, will retry after delay.",
+                                "`receive_messages` failed, will retry after delay.",
                             );
-                            tokio::time::sleep(delay).await;
+                            // Ensure shutdown can still interrupt the backoff delay
+                            select! {
+                                _ = &mut shutdown => {
+                                    tracing::info!("Shutdown signal received during backoff, exiting.");
+                                    break;
+                                },
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                            continue;
                         }
                     }
-                },
+                }
+            };
+
+            // If SQS returned no messages, continue polling
+            if messages.is_empty() {
+                continue;
             }
+
+            tracing::info!("Starting to process a batch of {} SQS messages.", messages.len());
+            
+            // 2. Process the fetched batch COMPLETELY without being interrupted by the shutdown signal
+            self.process_batch(messages).await;
+            
+            tracing::info!("Successfully completed processing the batch of SQS messages.");
         }
+        
+        tracing::info!("SQS ingestor worker has fully finalized and shut down. All queue processing for this worker is complete.");
     }
 
-    async fn run_once(&mut self) -> Result<(), ()> {
-        let messages = match self.receive_messages().await {
-            Ok(messages) => {
-                emit!(SqsMessageReceiveSucceeded {
-                    count: messages.len(),
-                });
-                messages
+    async fn process_batch(&mut self, messages: Vec<Message>) {
+        let total_messages = messages.len();
+        
+        for (idx, message) in messages.into_iter().enumerate() {
+            // Fast-check the shutdown signal mid-batch
+            // If the user hit Ctrl+C, we don't want to start on the next SQS message
+            // in the batch, so we gracefully abort the batch loop early.
+            if self.shutdown.clone().now_or_never().is_some() {
+                tracing::warn!(
+                    "SHUTDOWN STATUS: Halting batch processing early. Skipping {} remaining SQS messages to exit promptly. \
+                     Skipped messages remain safely on the queue.",
+                    total_messages - idx
+                );
+                break;
             }
-            Err(err) => {
-                emit!(SqsMessageReceiveError { error: &err });
-                return Err(());
-            }
-        };
 
-        let mut delete_entries = Vec::new();
-        let mut deferred_entries = Vec::new();
-        for message in messages {
             let receipt_handle = match message.receipt_handle {
                 None => {
-                    // I don't think this will ever actually happen, but is just an artifact of the
-                    // AWS's API predilection for returning nullable values for all response
-                    // attributes
                     warn!(message = "Refusing to process message with no receipt_handle.", ?message.message_id);
                     continue;
                 }
@@ -465,6 +494,7 @@ impl IngestorProcess {
                 .message_id
                 .clone()
                 .unwrap_or_else(|| "<unknown>".to_owned());
+                
             match self.handle_sqs_message(message.clone()).await {
                 Ok(()) => {
                     emit!(SqsMessageProcessingSucceeded {
@@ -476,13 +506,32 @@ impl IngestorProcess {
                             id = message_id,
                             receipt_handle = receipt_handle,
                         );
-                        delete_entries.push(
-                            DeleteMessageBatchRequestEntry::builder()
-                                .id(message_id.clone())
-                                .receipt_handle(receipt_handle)
-                                .build()
-                                .expect("all required builder params specified"),
-                        );
+                        let entry = DeleteMessageBatchRequestEntry::builder()
+                            .id(message_id.clone())
+                            .receipt_handle(receipt_handle.clone())
+                            .build()
+                            .expect("all required builder params specified");
+                        
+                        match self.delete_messages(vec![entry]).await {
+                            Ok(result) => {
+                                if !result.successful.is_empty() {
+                                    emit!(SqsMessageDeleteSucceeded { message_ids: result.successful });
+                                }
+                                if !result.failed.is_empty() {
+                                    emit!(SqsMessageDeletePartialError { entries: result.failed });
+                                }
+                            }
+                            Err(err) => {
+                                emit!(SqsMessageDeleteBatchError {
+                                    entries: vec![DeleteMessageBatchRequestEntry::builder()
+                                        .id(message_id)
+                                        .receipt_handle(receipt_handle)
+                                        .build()
+                                        .unwrap()],
+                                    error: err,
+                                });
+                            }
+                        }
                     }
                 }
                 Err(err) => {
@@ -499,28 +548,66 @@ impl IngestorProcess {
                                     deferred_queue = deferred.queue_url,
                                 );
 
-                                deferred_entries.push(
-                                    SendMessageBatchRequestEntry::builder()
-                                        .id(message_id.clone())
-                                        .message_body(message.body.unwrap_or_default())
-                                        .build()
-                                        .expect("all required builder params specified"),
-                                );
+                                let entry = SendMessageBatchRequestEntry::builder()
+                                    .id(message_id.clone())
+                                    .message_body(message.body.clone().unwrap_or_default())
+                                    .build()
+                                    .expect("all required builder params specified");
+
+                                match self.send_messages(vec![entry], deferred.queue_url.clone()).await {
+                                    Ok(result) => {
+                                        if !result.successful.is_empty() {
+                                            emit!(SqsMessageSentSucceeded { message_ids: result.successful });
+                                        }
+                                        if !result.failed.is_empty() {
+                                            emit!(SqsMessageSentPartialError { entries: result.failed });
+                                        }
+                                    }
+                                    Err(send_err) => {
+                                        emit!(SqsMessageSendBatchError {
+                                            entries: vec![SendMessageBatchRequestEntry::builder()
+                                                .id(message_id.clone())
+                                                .message_body(message.body.clone().unwrap_or_default())
+                                                .build()
+                                                .unwrap()],
+                                            error: send_err,
+                                        });
+                                    }
+                                }
                             }
-                            //  maybe delete the message from current queue since we have processed it
+                            
                             if self.state.delete_message {
                                 trace!(
                                     message = "Queued SQS message for deletion.",
                                     id = message_id,
                                     receipt_handle = receipt_handle,
                                 );
-                                delete_entries.push(
-                                    DeleteMessageBatchRequestEntry::builder()
-                                        .id(message_id)
-                                        .receipt_handle(receipt_handle)
-                                        .build()
-                                        .expect("all required builder params specified"),
-                                );
+                                let entry = DeleteMessageBatchRequestEntry::builder()
+                                    .id(message_id.clone())
+                                    .receipt_handle(receipt_handle.clone())
+                                    .build()
+                                    .expect("all required builder params specified");
+                                
+                                match self.delete_messages(vec![entry]).await {
+                                    Ok(result) => {
+                                        if !result.successful.is_empty() {
+                                            emit!(SqsMessageDeleteSucceeded { message_ids: result.successful });
+                                        }
+                                        if !result.failed.is_empty() {
+                                            emit!(SqsMessageDeletePartialError { entries: result.failed });
+                                        }
+                                    }
+                                    Err(del_err) => {
+                                        emit!(SqsMessageDeleteBatchError {
+                                            entries: vec![DeleteMessageBatchRequestEntry::builder()
+                                                .id(message_id) // Last use
+                                                .receipt_handle(receipt_handle) // Last use
+                                                .build()
+                                                .unwrap()],
+                                            error: del_err,
+                                        });
+                                    }
+                                }
                             }
                         }
                         _ => {
@@ -533,71 +620,17 @@ impl IngestorProcess {
                 }
             }
         }
-
-        // Should consider removing failed deferrals from the delete_entries
-        if !deferred_entries.is_empty() {
-            let Some(deferred) = &self.state.deferred else {
-                warn!("Deferred queue not configured, but received deferred entries.");
-                return Ok(());
-            };
-            let cloned_entries = deferred_entries.clone();
-            match self
-                .send_messages(deferred_entries, deferred.queue_url.clone())
-                .await
-            {
-                Ok(result) => {
-                    if !result.successful.is_empty() {
-                        emit!(SqsMessageSentSucceeded {
-                            message_ids: result.successful,
-                        })
-                    }
-
-                    if !result.failed.is_empty() {
-                        emit!(SqsMessageSentPartialError {
-                            entries: result.failed
-                        })
-                    }
-                }
-                Err(err) => {
-                    emit!(SqsMessageSendBatchError {
-                        entries: cloned_entries,
-                        error: err,
-                    });
-                }
-            }
-        }
-        if !delete_entries.is_empty() {
-            // We need these for a correct error message if the batch fails overall.
-            let cloned_entries = delete_entries.clone();
-            match self.delete_messages(delete_entries).await {
-                Ok(result) => {
-                    // Batch deletes can have partial successes/failures, so we have to check
-                    // for both cases and emit accordingly.
-                    if !result.successful.is_empty() {
-                        emit!(SqsMessageDeleteSucceeded {
-                            message_ids: result.successful,
-                        });
-                    }
-
-                    if !result.failed.is_empty() {
-                        emit!(SqsMessageDeletePartialError {
-                            entries: result.failed
-                        });
-                    }
-                }
-                Err(err) => {
-                    emit!(SqsMessageDeleteBatchError {
-                        entries: cloned_entries,
-                        error: err,
-                    });
-                }
-            }
-        }
-        Ok(())
     }
 
     async fn handle_sqs_message(&mut self, message: Message) -> Result<(), ProcessingError> {
-        let sqs_body = message.body.unwrap_or_default();
+        let sqs_body = message.body.clone().unwrap_or_default();
+
+        tracing::info!(
+            message_id = ?message.message_id,
+            body = %sqs_body,
+            "Received raw SQS message body"
+        );
+
         let sqs_body = serde_json::from_str::<SnsNotification>(sqs_body.as_ref())
             .map(|notification| notification.message)
             .unwrap_or(sqs_body);
@@ -615,14 +648,198 @@ impl IngestorProcess {
                 Ok(())
             }
             SqsEvent::Event(s3_event) => self.handle_s3_event(s3_event).await,
+            SqsEvent::CrowdStrike(fdr_event) => self.handle_crowdstrike_event(fdr_event).await,
         }
     }
 
     async fn handle_s3_event(&mut self, s3_event: S3Event) -> Result<(), ProcessingError> {
-        for record in s3_event.records {
-            self.handle_s3_event_record(record, self.log_namespace)
-                .await?
+        let total_records = s3_event.records.len();
+        let pending_files = Arc::new(AtomicUsize::new(total_records));
+        
+        let futures = s3_event.records.into_iter().map(|record| {
+            let mut process = self.clone();
+            let bucket = record.s3.bucket.name.clone();
+            let key = record.s3.object.key.clone();
+            let region = record.aws_region.clone();
+
+            async move {
+                let fut = async move {
+                    process.handle_s3_event_record(record, process.log_namespace).await
+                };
+                
+                match tokio::spawn(fut.in_current_span()).await {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        if join_err.is_panic() {
+                            panic::resume_unwind(join_err.into_panic());
+                        } else {
+                            tracing::error!(%bucket, %key, "S3 processing task was abruptly cancelled");
+                            Err(ProcessingError::ErrorAcknowledgement {
+                                region,
+                                bucket,
+                                key,
+                            })
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut stream = futures::stream::iter(futures).buffer_unordered(10);
+        let mut final_error = None;
+
+        // Monitor stream with integrated shutdown awareness and status reporting
+        let shutdown_sig = self.shutdown.clone().fuse();
+        pin!(shutdown_sig);
+        let mut is_shutting_down = false;
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+        loop {
+            select! {
+                _ = &mut shutdown_sig, if !is_shutting_down => {
+                    is_shutting_down = true;
+                    let remaining = pending_files.load(Ordering::Relaxed);
+                    tracing::warn!(
+                        "GRACEFUL SHUTDOWN INITIATED: Vector is wrapping up {} active S3 files in this batch. \
+                         Please DO NOT force kill the process...", remaining
+                    );
+                }
+                _ = interval.tick(), if is_shutting_down => {
+                    let remaining = pending_files.load(Ordering::Relaxed);
+                    if remaining > 0 {
+                        tracing::warn!("SHUTDOWN STATUS: Still wrapping up {} S3 files...", remaining);
+                    }
+                }
+                result = stream.next() => {
+                    match result {
+                        Some(res) => {
+                            let remaining = pending_files.fetch_sub(1, Ordering::Relaxed) - 1;
+                            if let Err(e) = res {
+                                tracing::error!("File processing failed: {:?}", e);
+                                if final_error.is_none() {
+                                    final_error = Some(e);
+                                }
+                            }
+                            if is_shutting_down && remaining == 0 {
+                                tracing::info!("SHUTDOWN STATUS: All files in current event successfully wrapped up.");
+                            }
+                        }
+                        None => break, // Stream is completely empty
+                    }
+                }
+            }
         }
+        
+        if let Some(err) = final_error {
+            return Err(err);
+        }
+        
+        tracing::info!("All {} S3 files in the current event completed successfully.", total_records);
+        Ok(())
+    }
+
+    async fn handle_crowdstrike_event(&mut self, fdr_event: CrowdStrikeFdrEvent) -> Result<(), ProcessingError> {
+        let total_records = fdr_event.files.len();
+        let pending_files = Arc::new(AtomicUsize::new(total_records));
+        
+        let futures = fdr_event.files.into_iter().map(|file| {
+            let mut process = self.clone();
+            let bucket = fdr_event.bucket.clone();
+            let key = file.path.clone();
+            let region = process.state.region.as_ref().to_string(); 
+
+            let record = S3EventRecord {
+                event_version: S3EventVersion { major: 2, minor: 1 },
+                event_source: "aws:s3".to_string(),
+                aws_region: region.clone(), 
+                event_name: S3EventName {
+                    kind: "ObjectCreated".to_string(),
+                    name: "Put".to_string(),
+                },
+                event_time: Utc::now(),
+                s3: S3Message {
+                    bucket: S3Bucket {
+                        name: bucket.clone(),
+                    },
+                    object: S3Object {
+                        key: key.clone(),
+                    },
+                },
+            };
+
+            async move {
+                let fut = async move {
+                    process.handle_s3_event_record(record, process.log_namespace).await
+                };
+                
+                match tokio::spawn(fut.in_current_span()).await {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        if join_err.is_panic() {
+                            panic::resume_unwind(join_err.into_panic());
+                        } else {
+                            tracing::error!(%bucket, %key, "S3 processing task was abruptly cancelled");
+                            Err(ProcessingError::ErrorAcknowledgement {
+                                region,
+                                bucket,
+                                key,
+                            })
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut stream = futures::stream::iter(futures).buffer_unordered(10);
+        let mut final_error = None;
+
+        // Monitor stream with integrated shutdown awareness and status reporting
+        let shutdown_sig = self.shutdown.clone().fuse();
+        pin!(shutdown_sig);
+        let mut is_shutting_down = false;
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+        loop {
+            select! {
+                _ = &mut shutdown_sig, if !is_shutting_down => {
+                    is_shutting_down = true;
+                    let remaining = pending_files.load(Ordering::Relaxed);
+                    tracing::warn!(
+                        "GRACEFUL SHUTDOWN INITIATED: Vector is wrapping up {} active S3 files in this batch. \
+                         Please DO NOT force kill the process...", remaining
+                    );
+                }
+                _ = interval.tick(), if is_shutting_down => {
+                    let remaining = pending_files.load(Ordering::Relaxed);
+                    if remaining > 0 {
+                        tracing::warn!("SHUTDOWN STATUS: Still wrapping up {} S3 files...", remaining);
+                    }
+                }
+                result = stream.next() => {
+                    match result {
+                        Some(res) => {
+                            let remaining = pending_files.fetch_sub(1, Ordering::Relaxed) - 1;
+                            if let Err(e) = res {
+                                tracing::error!("File processing failed: {:?}", e);
+                                if final_error.is_none() {
+                                    final_error = Some(e);
+                                }
+                            }
+                            if is_shutting_down && remaining == 0 {
+                                tracing::info!("SHUTDOWN STATUS: All files in current event successfully wrapped up.");
+                            }
+                        }
+                        None => break, // Stream is completely empty
+                    }
+                }
+            }
+        }
+        
+        if let Some(err) = final_error {
+            return Err(err);
+        }
+        
+        tracing::info!("All {} S3 files in the current CrowdStrike event completed successfully.", total_records);
         Ok(())
     }
 
@@ -669,7 +886,62 @@ impl IngestorProcess {
             }
         }
 
+        let mut backoff = ExponentialBackoff::default().max_delay(Duration::from_secs(10));
+        let max_retries = 3;
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+            match self.process_s3_object(&s3_event, log_namespace).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // Fast-fail out of the retry loop if the entire Vector pipeline has been gracefully 
+                    // closed for shutdown. Retrying closed pipelines blocks the shutdown from completing.
+                    if let ProcessingError::PipelineSend { source: SendError::Closed, .. } = &err {
+                        tracing::warn!(
+                            bucket = %s3_event.s3.bucket.name,
+                            key = %s3_event.s3.object.key,
+                            "Pipeline closed during file processing. Aborting retries to allow graceful exit."
+                        );
+                        return Err(err);
+                    }
+
+                    if attempts > max_retries {
+                        tracing::error!(
+                            bucket = %s3_event.s3.bucket.name,
+                            key = %s3_event.s3.object.key,
+                            "Exhausted retries for S3 object."
+                        );
+                        return Err(err);
+                    }
+                    
+                    let delay = backoff.next().unwrap_or(Duration::from_secs(10));
+                    tracing::warn!(
+                        bucket = %s3_event.s3.bucket.name,
+                        key = %s3_event.s3.object.key,
+                        attempt = attempts,
+                        max_retries = max_retries,
+                        ?err,
+                        "Failed to process S3 object, retrying after delay."
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    async fn process_s3_object(
+        &mut self,
+        s3_event: &S3EventRecord,
+        log_namespace: LogNamespace,
+    ) -> Result<(), ProcessingError> {
         let download_start = Instant::now();
+
+        tracing::info!(
+            bucket = %s3_event.s3.bucket.name,
+            key = %s3_event.s3.object.key,
+            "Starting processing of S3 file"
+        );
 
         let object_result = self
             .state
@@ -769,7 +1041,7 @@ impl IngestorProcess {
                         handle_single_log(
                             log_event,
                             log_namespace,
-                            &s3_event,
+                            s3_event,
                             &metadata,
                             timestamp,
                         );
@@ -809,12 +1081,24 @@ impl IngestorProcess {
         drop(batch);
 
         if let Some(error) = read_error {
+            tracing::error!(
+                bucket = %s3_event.s3.bucket.name,
+                key = %s3_event.s3.object.key,
+                ?error,
+                "Finished processing of S3 file with read error"
+            );
             Err(ProcessingError::ReadObject {
                 source: error,
                 bucket: s3_event.s3.bucket.name.clone(),
                 key: s3_event.s3.object.key.clone(),
             })
         } else if let Some(error) = send_error {
+            tracing::error!(
+                bucket = %s3_event.s3.bucket.name,
+                key = %s3_event.s3.object.key,
+                ?error,
+                "Finished processing of S3 file with send error"
+            );
             Err(ProcessingError::PipelineSend {
                 source: error,
                 bucket: s3_event.s3.bucket.name.clone(),
@@ -822,7 +1106,14 @@ impl IngestorProcess {
             })
         } else {
             match receiver {
-                None => Ok(()),
+                None => {
+                    tracing::info!(
+                        bucket = %s3_event.s3.bucket.name,
+                        key = %s3_event.s3.object.key,
+                        "Finished processing of S3 file successfully (No acknowledgements)"
+                    );
+                    Ok(())
+                },
                 Some(receiver) => {
                     let result = receiver.await;
                     match result {
@@ -832,14 +1123,31 @@ impl IngestorProcess {
                                 bucket = s3_event.s3.bucket.name,
                                 key = s3_event.s3.object.key,
                             );
+                            tracing::info!(
+                                bucket = %s3_event.s3.bucket.name,
+                                key = %s3_event.s3.object.key,
+                                "Finished processing of S3 file successfully (Delivered)"
+                            );
                             Ok(())
                         }
-                        BatchStatus::Errored => Err(ProcessingError::ErrorAcknowledgement {
-                            bucket: s3_event.s3.bucket.name,
-                            key: s3_event.s3.object.key,
-                            region: s3_event.aws_region,
-                        }),
+                        BatchStatus::Errored => {
+                            tracing::error!(
+                                bucket = %s3_event.s3.bucket.name,
+                                key = %s3_event.s3.object.key,
+                                "Finished processing of S3 file (Errored)"
+                            );
+                            Err(ProcessingError::ErrorAcknowledgement {
+                                bucket: s3_event.s3.bucket.name.clone(),
+                                key: s3_event.s3.object.key.clone(),
+                                region: s3_event.aws_region.clone(),
+                            })
+                        },
                         BatchStatus::Rejected => {
+                            tracing::error!(
+                                bucket = %s3_event.s3.bucket.name,
+                                key = %s3_event.s3.object.key,
+                                "Finished processing of S3 file (Rejected)"
+                            );
                             if self.state.delete_failed_message {
                                 warn!(
                                     message =
@@ -850,9 +1158,9 @@ impl IngestorProcess {
                                 Ok(())
                             } else {
                                 Err(ProcessingError::ErrorAcknowledgement {
-                                    bucket: s3_event.s3.bucket.name,
-                                    key: s3_event.s3.object.key,
-                                    region: s3_event.aws_region,
+                                    bucket: s3_event.s3.bucket.name.clone(),
+                                    key: s3_event.s3.object.key.clone(),
+                                    region: s3_event.aws_region.clone(),
                                 })
                             }
                         }
@@ -902,6 +1210,21 @@ impl IngestorProcess {
             .set_entries(Some(entries))
             .send()
             .await
+    }
+}
+
+impl Clone for IngestorProcess {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            out: self.out.clone(),
+            shutdown: self.shutdown.clone(),
+            acknowledgements: self.acknowledgements,
+            log_namespace: self.log_namespace,
+            bytes_received: self.bytes_received.clone(),
+            events_received: self.events_received.clone(),
+            backoff: ExponentialBackoff::default().max_delay(Duration::from_secs(30)),
+        }
     }
 }
 
@@ -990,6 +1313,22 @@ pub struct SnsNotification {
 enum SqsEvent {
     Event(S3Event),
     TestEvent(S3TestEvent),
+    CrowdStrike(CrowdStrikeFdrEvent),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrowdStrikeFdrEvent {
+    pub bucket: String,
+    pub path_prefix: String,
+    pub files: Vec<CrowdStrikeFdrFile>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrowdStrikeFdrFile {
+    pub path: String,
+    pub size: i64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1172,122 +1511,157 @@ mod urlencoded_string {
         )
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[test]
-fn test_key_deserialize() {
-    let value = serde_json::from_str(r#"{"key": "noog+nork"}"#).unwrap();
-    assert_eq!(
-        S3Object {
-            key: "noog nork".to_string(),
-        },
-        value
-    );
+   #[test]
+    fn test_key_deserialize() {
+        let value: S3Object = serde_json::from_str(r#"{"key": "noog+nork"}"#).unwrap();
+        assert_eq!(
+            S3Object {
+                key: "noog nork".to_string(),
+            },
+            value
+        );
 
-    let value = serde_json::from_str(r#"{"key": "noog%2bnork"}"#).unwrap();
-    assert_eq!(
-        S3Object {
-            key: "noog+nork".to_string(),
-        },
-        value
-    );
-}
+        let value: S3Object = serde_json::from_str(r#"{"key": "noog%2bnork"}"#).unwrap();
+        assert_eq!(
+            S3Object {
+                key: "noog+nork".to_string(),
+            },
+            value
+        );
+    }
 
-#[test]
-fn test_s3_testevent() {
-    let value: S3TestEvent = serde_json::from_str(
-        r#"{
-        "Service":"Amazon S3",
-        "Event":"s3:TestEvent",
-        "Time":"2014-10-13T15:57:02.089Z",
-        "Bucket":"bucketname",
-        "RequestId":"5582815E1AEA5ADF",
-        "HostId":"8cLeGAmw098X5cv4Zkwcmo8vvZa3eH3eKxsPzbB9wrR+YstdA6Knx4Ip8EXAMPLE"
-     }"#,
-    )
-    .unwrap();
+    #[test]
+    fn test_s3_testevent() {
+        let value: S3TestEvent = serde_json::from_str(
+            r#"{
+            "Service":"Amazon S3",
+            "Event":"s3:TestEvent",
+            "Time":"2014-10-13T15:57:02.089Z",
+            "Bucket":"bucketname",
+            "RequestId":"5582815E1AEA5ADF",
+            "HostId":"8cLeGAmw098X5cv4Zkwcmo8vvZa3eH3eKxsPzbB9wrR+YstdA6Knx4Ip8EXAMPLE"
+         }"#,
+        )
+        .unwrap();
 
-    assert_eq!(value.service, "Amazon S3".to_string());
-    assert_eq!(value.bucket, "bucketname".to_string());
-    assert_eq!(value.event.kind, "s3".to_string());
-    assert_eq!(value.event.name, "TestEvent".to_string());
-}
+        assert_eq!(value.service, "Amazon S3".to_string());
+        assert_eq!(value.bucket, "bucketname".to_string());
+        assert_eq!(value.event.kind, "s3".to_string());
+        assert_eq!(value.event.name, "TestEvent".to_string());
+    }
 
-#[test]
-fn test_s3_sns_testevent() {
-    let sns_value: SnsNotification = serde_json::from_str(
-        r#"{
-        "Type" : "Notification",
-        "MessageId" : "63a3f6b6-d533-4a47-aef9-fcf5cf758c76",
-        "TopicArn" : "arn:aws:sns:us-west-2:123456789012:MyTopic",
-        "Subject" : "Testing publish to subscribed queues",
-        "Message" : "{\"Bucket\":\"bucketname\",\"Event\":\"s3:TestEvent\",\"HostId\":\"8cLeGAmw098X5cv4Zkwcmo8vvZa3eH3eKxsPzbB9wrR+YstdA6Knx4Ip8EXAMPLE\",\"RequestId\":\"5582815E1AEA5ADF\",\"Service\":\"Amazon S3\",\"Time\":\"2014-10-13T15:57:02.089Z\"}",
-        "Timestamp" : "2012-03-29T05:12:16.901Z",
-        "SignatureVersion" : "1",
-        "Signature" : "EXAMPLEnTrFPa3...",
-        "SigningCertURL" : "https://sns.us-west-2.amazonaws.com/SimpleNotificationService-f3ecfb7224c7233fe7bb5f59f96de52f.pem",
-        "UnsubscribeURL" : "https://sns.us-west-2.amazonaws.com/?Action=Unsubscribe&SubscriptionArn=arn:aws:sns:us-west-2:123456789012:MyTopic:c7fe3a54-ab0e-4ec2-88e0-db410a0f2bee"
-     }"#,
-    ).unwrap();
+    #[test]
+    fn test_s3_sns_testevent() {
+        let sns_value: SnsNotification = serde_json::from_str(
+            r#"{
+            "Type" : "Notification",
+            "MessageId" : "63a3f6b6-d533-4a47-aef9-fcf5cf758c76",
+            "TopicArn" : "arn:aws:sns:us-west-2:123456789012:MyTopic",
+            "Subject" : "Testing publish to subscribed queues",
+            "Message" : "{\"Bucket\":\"bucketname\",\"Event\":\"s3:TestEvent\",\"HostId\":\"8cLeGAmw098X5cv4Zkwcmo8vvZa3eH3eKxsPzbB9wrR+YstdA6Knx4Ip8EXAMPLE\",\"RequestId\":\"5582815E1AEA5ADF\",\"Service\":\"Amazon S3\",\"Time\":\"2014-10-13T15:57:02.089Z\"}",
+            "Timestamp" : "2012-03-29T05:12:16.901Z",
+            "SignatureVersion" : "1",
+            "Signature" : "EXAMPLEnTrFPa3...",
+            "SigningCertURL" : "https://sns.us-west-2.amazonaws.com/SimpleNotificationService-f3ecfb7224c7233fe7bb5f59f96de52f.pem",
+            "UnsubscribeURL" : "https://sns.us-west-2.amazonaws.com/?Action=Unsubscribe&SubscriptionArn=arn:aws:sns:us-west-2:123456789012:MyTopic:c7fe3a54-ab0e-4ec2-88e0-db410a0f2bee"
+         }"#,
+        ).unwrap();
 
-    assert_eq!(
-        sns_value.timestamp,
-        DateTime::parse_from_rfc3339("2012-03-29T05:12:16.901Z")
-            .unwrap()
-            .to_utc()
-    );
+        assert_eq!(
+            sns_value.timestamp,
+            DateTime::parse_from_rfc3339("2012-03-29T05:12:16.901Z")
+                .unwrap()
+                .to_utc()
+        );
 
-    let value: S3TestEvent = serde_json::from_str(sns_value.message.as_ref()).unwrap();
+        let value: S3TestEvent = serde_json::from_str(sns_value.message.as_ref()).unwrap();
 
-    assert_eq!(value.service, "Amazon S3".to_string());
-    assert_eq!(value.bucket, "bucketname".to_string());
-    assert_eq!(value.event.kind, "s3".to_string());
-    assert_eq!(value.event.name, "TestEvent".to_string());
-}
+        assert_eq!(value.service, "Amazon S3".to_string());
+        assert_eq!(value.bucket, "bucketname".to_string());
+        assert_eq!(value.event.kind, "s3".to_string());
+        assert_eq!(value.event.name, "TestEvent".to_string());
+    }
 
-#[test]
-fn parse_sqs_config() {
-    let config: Config = serde_yaml::from_str(
-        r#"queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
-"#,
-    )
-    .unwrap();
-    assert_eq!(
-        config.queue_url,
-        "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
-    );
-    assert!(config.deferred.is_none());
+    #[test]
+    fn test_crowdstrike_fdr_event() {
+        let payload = r#"{
+            "bucket": "fdr-your-company-bucket",
+            "pathPrefix": "data/2026-03-31/",
+            "files": [
+                {
+                    "path": "data/2026-03-31/fdr_telemetry.json.gz",
+                    "size": 123456
+                }
+            ]
+        }"#;
 
-    let config: Config = serde_yaml::from_str(indoc::indoc! {r#"
-        queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
-        deferred:
-          queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/MyDeferredQueue"
-          max_age_secs: 3600
-    "#})
-    .unwrap();
-    assert_eq!(
-        config.queue_url,
-        "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
-    );
-    let Some(deferred) = config.deferred else {
-        panic!("Expected deferred config");
-    };
-    assert_eq!(
-        deferred.queue_url,
-        "https://sqs.us-east-1.amazonaws.com/123456789012/MyDeferredQueue"
-    );
-    assert_eq!(deferred.max_age_secs, 3600);
+        let parsed: SqsEvent = serde_json::from_str(payload).unwrap();
+        match parsed {
+            SqsEvent::CrowdStrike(fdr) => {
+                assert_eq!(fdr.bucket, "fdr-your-company-bucket");
+                assert_eq!(fdr.files[0].path, "data/2026-03-31/fdr_telemetry.json.gz");
+                assert_eq!(fdr.files[0].size, 123456);
+            }
+            _ => panic!("Did not parse as CrowdStrike event"),
+        }
+    }
 
-    let test: Result<Config, serde_yaml::Error> = serde_yaml::from_str(indoc::indoc! {r#"
-        queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
-        deferred:
-          max_age_secs: 3600
-    "#});
-    assert!(test.is_err());
+    #[test]
+    fn parse_sqs_config() {
+        let config: Config = toml::from_str(
+            r#"
+                queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.queue_url,
+            "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+        );
+        assert!(config.deferred.is_none());
 
-    let test: Result<Config, serde_yaml::Error> = serde_yaml::from_str(indoc::indoc! {r#"
-        queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
-        deferred:
-          queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/MyDeferredQueue"
-    "#});
-    assert!(test.is_err());
+        let config: Config = toml::from_str(
+            r#"
+                queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+                [deferred]
+                queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyDeferredQueue"
+                max_age_secs = 3600
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.queue_url,
+            "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+        );
+        let Some(deferred) = config.deferred else {
+            panic!("Expected deferred config");
+        };
+        assert_eq!(
+            deferred.queue_url,
+            "https://sqs.us-east-1.amazonaws.com/123456789012/MyDeferredQueue"
+        );
+        assert_eq!(deferred.max_age_secs, 3600);
+
+        let test: Result<Config, toml::de::Error> = toml::from_str(
+            r#"
+                queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+                [deferred]
+                max_age_secs = 3600
+            "#,
+        );
+        assert!(test.is_err());
+
+        let test: Result<Config, toml::de::Error> = toml::from_str(
+            r#"
+                queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+                [deferred]
+                queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyDeferredQueue"
+            "#,
+        );
+        assert!(test.is_err());
+    }
 }
