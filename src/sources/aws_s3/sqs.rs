@@ -148,10 +148,21 @@ pub(super) struct Config {
     /// Configuration for deferring events to another queue based on their age.
     #[configurable(derived)]
     pub(super) deferred: Option<DeferredConfig>,
+
+    /// Maximum number of files to process concurrently from a single SQS message.
+    #[serde(default = "default_file_concurrency")]
+    #[derivative(Default(value = "default_file_concurrency()"))]
+    #[configurable(metadata(docs::type_unit = "files"))]
+    #[configurable(metadata(docs::examples = 50))]
+    pub(super) file_concurrency: usize,
 }
 
 const fn default_poll_secs() -> u32 {
     15
+}
+
+const fn default_file_concurrency() -> usize {
+    10
 }
 
 const fn default_visibility_timeout_secs() -> u32 {
@@ -264,6 +275,7 @@ pub struct State {
     poll_secs: i32,
     max_number_of_messages: i32,
     client_concurrency: usize,
+    file_concurrency: usize,
     visibility_timeout_secs: i32,
     delete_message: bool,
     delete_failed_message: bool,
@@ -307,6 +319,7 @@ impl Ingestor {
                 .client_concurrency
                 .map(|n| n.get())
                 .unwrap_or_else(crate::num_threads),
+            file_concurrency: config.file_concurrency,
             visibility_timeout_secs: config.visibility_timeout_secs as i32,
             delete_message: config.delete_message,
             delete_failed_message: config.delete_failed_message,
@@ -749,7 +762,7 @@ impl IngestorProcess {
             }
         });
 
-        let mut stream = futures::stream::iter(futures).buffer_unordered(10);
+        let mut stream = futures::stream::iter(futures).buffer_unordered(self.state.file_concurrency);
         let mut deferred_records = Vec::new();
         let mut failed_records = Vec::new();
 
@@ -857,7 +870,7 @@ impl IngestorProcess {
             }
         });
 
-        let mut stream = futures::stream::iter(futures).buffer_unordered(10);
+        let mut stream = futures::stream::iter(futures).buffer_unordered(self.state.file_concurrency);
         let mut deferred_files = Vec::new();
         let mut failed_files = Vec::new();
 
