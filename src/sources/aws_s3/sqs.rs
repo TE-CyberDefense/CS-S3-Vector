@@ -4,7 +4,7 @@ use std::{
     num::NonZeroUsize,
     panic,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex,
     },
     time::{Duration, Instant},
@@ -14,6 +14,7 @@ use aws_sdk_s3::{operation::get_object::GetObjectError, Client as S3Client};
 use aws_sdk_sqs::{
     operation::{
         delete_message_batch::{DeleteMessageBatchError, DeleteMessageBatchOutput},
+        change_message_visibility::ChangeMessageVisibilityError,
         receive_message::ReceiveMessageError,
         send_message_batch::{SendMessageBatchError, SendMessageBatchOutput},
     },
@@ -33,10 +34,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 use snafu::{ResultExt, Snafu};
 use tokio::{
-    pin, select,
     io::BufReader,
-    sync::{OwnedSemaphorePermit, Semaphore},
-    task::JoinSet,
+    pin, select,
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    task::{JoinHandle, JoinSet},
 };
 use tokio_util::codec::FramedRead;
 use tracing::Instrument;
@@ -45,7 +46,7 @@ use vector_lib::{
     configurable::configurable_component,
     event::MaybeAsLogMut,
     internal_event::{
-        ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
+        ByteSize, BytesReceived, InternalEventHandle as _, Protocol, Registered,
     },
     lookup::{metadata_path, path, PathPrefix},
     source_sender::SendError,
@@ -56,9 +57,9 @@ use crate::{
     codecs::Decoder,
     common::backoff::ExponentialBackoff,
     config::{SourceAcknowledgementsConfig, SourceContext},
-    event::{BatchNotifier, BatchStatus, EstimatedJsonEncodedSizeOf, LogEvent},
+    event::{BatchNotifier, BatchStatus, LogEvent},
     internal_events::{
-        EventsReceived, S3ObjectProcessingFailed, S3ObjectProcessingSucceeded,
+        S3ObjectProcessingFailed, S3ObjectProcessingSucceeded,
         SqsMessageProcessingError, SqsMessageProcessingSucceeded, SqsMessageReceiveError,
         SqsMessageReceiveSucceeded, SqsS3EventRecordInvalidEventIgnored, StreamClosedError,
     },
@@ -73,7 +74,6 @@ static SUPPORTED_S3_EVENT_VERSION: LazyLock<semver::VersionReq> =
     LazyLock::new(|| semver::VersionReq::parse("~2").unwrap());
 
 const DEFAULT_PARSE_CONCURRENCY_PER_FILE: usize = 2;
-// Increased to reduce tokio task scheduling overhead
 const DEFAULT_PARSE_CHUNK_SIZE: usize = 2500;
 const DEFAULT_READ_BUFFER_BYTES: usize = 128 * 1024;
 const MAX_REQUEUE_ATTEMPTS: u32 = 5;
@@ -83,13 +83,16 @@ const REQUEUE_DELAY_SECONDS: i32 = 30;
 #[configurable_component]
 #[derive(Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
+/// Configuration for forwarding SQS messages that reference objects older than the configured maximum age to a deferred queue.
 pub(super) struct DeferredConfig {
+    /// SQS queue URL used for deferred messages.
     #[configurable(metadata(
         docs::examples = "https://sqs.us-east-2.amazonaws.com/123456789012/MyQueue"
     ))]
     #[configurable(validation(format = "uri"))]
     pub(super) queue_url: String,
 
+    /// Maximum age, in seconds, of an S3 object notification before it is forwarded to the deferred queue.
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[configurable(metadata(docs::examples = 3600))]
     pub(super) max_age_secs: u64,
@@ -100,56 +103,69 @@ pub(super) struct DeferredConfig {
 #[derive(Clone, Debug, Derivative)]
 #[derivative(Default)]
 #[serde(deny_unknown_fields)]
+/// Configuration for consuming S3 object notifications from an SQS queue.
 pub(super) struct Config {
+    /// SQS queue URL to poll for S3 object notifications.
     #[configurable(metadata(
         docs::examples = "https://sqs.us-east-2.amazonaws.com/123456789012/MyQueue"
     ))]
     #[configurable(validation(format = "uri"))]
     pub(super) queue_url: String,
 
+    /// Long-poll wait time, in seconds, used when receiving messages from SQS.
     #[serde(default = "default_poll_secs")]
     #[derivative(Default(value = "default_poll_secs()"))]
     #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(validation(range(min = 0, max = 20)))]
     pub(super) poll_secs: u32,
 
+    /// Visibility timeout, in seconds, to apply to received SQS messages while they are being processed.
     #[serde(default = "default_visibility_timeout_secs")]
     #[derivative(Default(value = "default_visibility_timeout_secs()"))]
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[configurable(metadata(docs::human_name = "Visibility Timeout"))]
     pub(super) visibility_timeout_secs: u32,
 
+    /// Whether successfully handled original SQS messages should be deleted from the queue.
     #[serde(default = "default_true")]
     #[derivative(Default(value = "default_true()"))]
     pub(super) delete_message: bool,
 
+    /// Whether messages that fail downstream acknowledgement should still be deleted instead of requeued.
     #[serde(default = "default_true")]
     #[derivative(Default(value = "default_true()"))]
     pub(super) delete_failed_message: bool,
 
+    /// Maximum number of SQS message worker tasks to run concurrently.
     #[configurable(metadata(docs::type_unit = "tasks"))]
     #[configurable(metadata(docs::examples = 5))]
     pub(super) client_concurrency: Option<NonZeroUsize>,
 
+    /// Maximum number of messages to request from SQS in a single receive call.
     #[serde(default = "default_max_number_of_messages")]
     #[derivative(Default(value = "default_max_number_of_messages()"))]
     #[configurable(metadata(docs::human_name = "Max Messages"))]
     #[configurable(metadata(docs::examples = 1))]
     pub(super) max_number_of_messages: u32,
 
+    /// TLS options used by AWS clients for S3 and SQS requests.
     #[configurable(derived)]
     #[serde(default)]
     #[derivative(Default)]
     pub(super) tls_options: Option<TlsConfig>,
 
+    /// AWS request timeout options for S3 and SQS calls.
     #[configurable(derived)]
     #[derivative(Default)]
     #[serde(default)]
     #[serde(flatten)]
     pub(super) timeout: Option<AwsTimeout>,
 
+    /// Optional deferred queue settings for age-based S3 object deferral.
     #[configurable(derived)]
     pub(super) deferred: Option<DeferredConfig>,
 
+    /// Maximum number of S3 files to process concurrently for this source.
     #[serde(default = "default_file_concurrency")]
     #[derivative(Default(value = "default_file_concurrency()"))]
     #[configurable(metadata(docs::type_unit = "files"))]
@@ -205,6 +221,7 @@ pub enum ProcessingError {
 
     #[snafu(display("Failed to read all of s3://{}/{}: {}", bucket, key, source))]
     ReadObject {
+        #[snafu(source(false))]
         source: String,
         bucket: String,
         key: String,
@@ -302,7 +319,6 @@ pub struct State {
     queue_url: String,
     poll_secs: i32,
     max_number_of_messages: i32,
-    client_concurrency: usize,
     file_concurrency: usize,
     visibility_timeout_secs: i32,
     delete_message: bool,
@@ -353,7 +369,6 @@ impl Ingestor {
             queue_url: config.queue_url,
             poll_secs: config.poll_secs as i32,
             max_number_of_messages: config.max_number_of_messages as i32,
-            client_concurrency,
             file_concurrency,
             visibility_timeout_secs: config.visibility_timeout_secs as i32,
             delete_message: config.delete_message,
@@ -385,7 +400,6 @@ impl Ingestor {
             log_namespace,
             acknowledgements,
             bytes_received: register!(BytesReceived::from(Protocol::HTTP)),
-            events_received: register!(EventsReceived),
             backoff: ExponentialBackoff::default().max_delay(Duration::from_secs(30)),
             tasks: JoinSet::new(),
         };
@@ -403,7 +417,6 @@ struct SqsPoller {
     acknowledgements: bool,
     log_namespace: LogNamespace,
     bytes_received: Registered<BytesReceived>,
-    events_received: Registered<EventsReceived>,
     backoff: ExponentialBackoff,
     tasks: JoinSet<()>,
 }
@@ -431,28 +444,27 @@ impl SqsPoller {
                         Err(_) => break,
                     }
                 }
-                result = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                    if let Some(result) = result {
-                        self.handle_join_result(result);
-                    }
-
-                    continue;
-                }
             };
 
-            let available_after_first = self.state.sqs_message_semaphore.available_permits();
+            let mut acquired_permits = vec![first_permit];
+            let max_additional = (self.state.max_number_of_messages as usize).saturating_sub(1);
 
-            let receive_count = (1 + available_after_first)
-                .min(self.state.max_number_of_messages as usize)
-                .max(1) as i32;
+            for _ in 0..max_additional {
+                match self.state.sqs_message_semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => acquired_permits.push(permit),
+                    Err(_) => break,
+                }
+            }
+
+            let receive_count = acquired_permits.len() as i32;
 
             let messages = select! {
                 _ = &mut shutdown => {
-                    drop(first_permit);
+                    drop(acquired_permits);
                     tracing::info!("Shutdown signal received before SQS receive completed.");
                     break;
                 }
-                result = self.receive_messages(receive_count) => {
+                result = Self::receive_messages(Arc::clone(&self.state), receive_count) => {
                     match result {
                         Ok(messages) => {
                             emit!(SqsMessageReceiveSucceeded {
@@ -463,7 +475,7 @@ impl SqsPoller {
                             messages
                         }
                         Err(err) => {
-                            drop(first_permit);
+                            drop(acquired_permits);
 
                             emit!(SqsMessageReceiveError {
                                 error: &err,
@@ -485,50 +497,18 @@ impl SqsPoller {
                         }
                     }
                 }
-                result = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                    drop(first_permit);
-
-                    if let Some(result) = result {
-                        self.handle_join_result(result);
-                    }
-
-                    continue;
-                }
             };
 
             if messages.is_empty() {
-                drop(first_permit);
+                drop(acquired_permits);
                 continue;
             }
 
-            let mut messages_iter = messages.into_iter();
-
-            if let Some(first_message) = messages_iter.next() {
-                self.spawn_worker(first_message, first_permit);
-            }
-
-            for message in messages_iter {
-                let permit = select! {
-                    _ = &mut shutdown => {
-                        tracing::info!("Shutdown signal received while dispatching SQS messages.");
-                        break;
-                    }
-                    permit = self.state.sqs_message_semaphore.clone().acquire_owned() => {
-                        match permit {
-                            Ok(permit) => permit,
-                            Err(_) => break,
-                        }
-                    }
-                    result = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                        if let Some(result) = result {
-                            self.handle_join_result(result);
-                        }
-
-                        continue;
-                    }
-                };
-
-                self.spawn_worker(message, permit);
+            let mut permits_iter = acquired_permits.into_iter();
+            for message in messages {
+                if let Some(permit) = permits_iter.next() {
+                    self.spawn_worker(message, permit);
+                }
             }
         }
 
@@ -552,7 +532,6 @@ impl SqsPoller {
             acknowledgements: self.acknowledgements,
             log_namespace: self.log_namespace,
             bytes_received: self.bytes_received.clone(),
-            events_received: self.events_received.clone(),
         };
 
         self.tasks.spawn(
@@ -575,16 +554,16 @@ impl SqsPoller {
     }
 
     async fn receive_messages(
-        &mut self,
+        state: Arc<State>,
         max_number_of_messages: i32,
     ) -> Result<Vec<Message>, SdkError<ReceiveMessageError, HttpResponse>> {
-        self.state
+        state
             .sqs_client
             .receive_message()
-            .queue_url(self.state.queue_url.clone())
+            .queue_url(state.queue_url.clone())
             .max_number_of_messages(max_number_of_messages)
-            .visibility_timeout(self.state.visibility_timeout_secs)
-            .wait_time_seconds(self.state.poll_secs)
+            .visibility_timeout(state.visibility_timeout_secs)
+            .wait_time_seconds(state.poll_secs)
             .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
             .message_attribute_names("VectorRetryCount")
             .send()
@@ -601,7 +580,89 @@ struct S3Worker {
     acknowledgements: bool,
     log_namespace: LogNamespace,
     bytes_received: Registered<BytesReceived>,
-    events_received: Registered<EventsReceived>,
+}
+
+struct VisibilityExtender {
+    stop_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl VisibilityExtender {
+    fn spawn(
+        state: Arc<State>,
+        receipt_handle: String,
+        shutdown: ShutdownSignal,
+    ) -> VisibilityExtender {
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            if state.visibility_timeout_secs <= 0 {
+                return;
+            }
+
+            let visibility_timeout_secs = state.visibility_timeout_secs;
+            let extend_interval = Duration::from_secs((visibility_timeout_secs as u64 / 2).max(1));
+            let shutdown = shutdown.fuse();
+            pin!(shutdown);
+
+            loop {
+                select! {
+                    _ = &mut shutdown => break,
+                    changed = stop_rx.changed() => {
+                        match changed {
+                            Ok(()) if *stop_rx.borrow() => break,
+                            Err(_) => break,
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep(extend_interval) => {
+                        if let Err(err) = change_message_visibility(
+                            &state.sqs_client,
+                            &state.queue_url,
+                            &receipt_handle,
+                            visibility_timeout_secs,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                error = ?err,
+                                "Failed to extend SQS message visibility timeout. Message may be delivered again before processing completes."
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        VisibilityExtender { stop_tx, task }
+    }
+
+    async fn stop(self) {
+        let _ = self.stop_tx.send(true);
+
+        if let Err(err) = self.task.await {
+            if err.is_panic() {
+                panic::resume_unwind(err.into_panic());
+            }
+
+            tracing::warn!("SQS visibility extender task was cancelled.");
+        }
+    }
+}
+
+async fn change_message_visibility(
+    sqs_client: &SqsClient,
+    queue_url: &str,
+    receipt_handle: &str,
+    visibility_timeout_secs: i32,
+) -> Result<(), SdkError<ChangeMessageVisibilityError, HttpResponse>> {
+    sqs_client
+        .change_message_visibility()
+        .queue_url(queue_url)
+        .receipt_handle(receipt_handle)
+        .visibility_timeout(visibility_timeout_secs)
+        .send()
+        .await
+        .map(|_| ())
 }
 
 impl S3Worker {
@@ -643,6 +704,11 @@ impl S3Worker {
         };
 
         let original_body = message.body.clone().unwrap_or_default();
+        let visibility_extender = VisibilityExtender::spawn(
+            Arc::clone(&self.state),
+            receipt_handle.clone(),
+            self.shutdown.clone(),
+        );
 
         let (mut can_delete_original, deferred_body, requeue_body) = match self.handle_sqs_message(message, retry_count).await {
             Ok(result) => {
@@ -656,7 +722,6 @@ impl S3Worker {
                     message_id: &message_id,
                     error: &err,
                 });
-                // Treat the entire message as a failure so it goes through retry/DLQ/deletion logic
                 (true, None, Some(original_body))
             }
         };
@@ -672,7 +737,7 @@ impl S3Worker {
                     Ok(entry) => {
                         match self.send_messages(vec![entry], deferred.queue_url.clone()).await {
                             Ok(output) => {
-                                let failed_entries = output.failed.as_ref().map_or(0, Vec::len);
+                                let failed_entries = output.failed.len();
                                 if failed_entries > 0 {
                                     can_delete_original = false;
                                     tracing::error!(
@@ -721,42 +786,42 @@ impl S3Worker {
                     "Failed records exceeded the local requeue attempt limit. Original message will not be deleted."
                 );
             } else {
-                let attr_val = match MessageAttributeValue::builder()
+                match MessageAttributeValue::builder()
                     .data_type("Number")
                     .string_value((retry_count + 1).to_string())
                     .build()
                 {
-                    Ok(attr_val) => attr_val,
-                    Err(err) => {
-                        tracing::error!(
-                            message_id = %message_id,
-                            error = ?err,
-                            "Failed to build retry count attribute. Original message will not be deleted."
-                        );
-                        return;
-                    }
-                };
+                    Ok(attr_val) => {
+                        let entry = SendMessageBatchRequestEntry::builder()
+                            .id(safe_batch_id.clone())
+                            .message_body(body)
+                            .delay_seconds(REQUEUE_DELAY_SECONDS)
+                            .message_attributes("VectorRetryCount", attr_val)
+                            .build();
 
-                let entry = SendMessageBatchRequestEntry::builder()
-                    .id(safe_batch_id.clone())
-                    .message_body(body)
-                    .delay_seconds(REQUEUE_DELAY_SECONDS)
-                    .message_attributes("VectorRetryCount", attr_val)
-                    .build();
-
-                match entry {
-                    Ok(entry) => {
-                        match self.send_messages(vec![entry], self.state.queue_url.clone()).await {
-                            Ok(output) => {
-                                let failed_entries = output.failed.as_ref().map_or(0, Vec::len);
-                                if failed_entries > 0 {
-                                    can_delete_original = false;
-                                    tracing::error!(
-                                        message_id = %message_id,
-                                        failed_entries,
-                                        failures = ?output.failed,
-                                        "Requeue SQS batch returned failed entries. Original message will not be deleted."
-                                    );
+                        match entry {
+                            Ok(entry) => {
+                                match self.send_messages(vec![entry], self.state.queue_url.clone()).await {
+                                    Ok(output) => {
+                                        let failed_entries = output.failed.len();
+                                        if failed_entries > 0 {
+                                            can_delete_original = false;
+                                            tracing::error!(
+                                                message_id = %message_id,
+                                                failed_entries,
+                                                failures = ?output.failed,
+                                                "Requeue SQS batch returned failed entries. Original message will not be deleted."
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        can_delete_original = false;
+                                        tracing::error!(
+                                            message_id = %message_id,
+                                            error = ?err,
+                                            "Failed to requeue SQS message. Original message will not be deleted."
+                                        );
+                                    }
                                 }
                             }
                             Err(err) => {
@@ -764,7 +829,7 @@ impl S3Worker {
                                 tracing::error!(
                                     message_id = %message_id,
                                     error = ?err,
-                                    "Failed to requeue SQS message. Original message will not be deleted."
+                                    "Failed to build requeue SQS message. Original message will not be deleted."
                                 );
                             }
                         }
@@ -774,12 +839,14 @@ impl S3Worker {
                         tracing::error!(
                             message_id = %message_id,
                             error = ?err,
-                            "Failed to build requeue SQS message. Original message will not be deleted."
+                            "Failed to build retry count attribute. Original message will not be deleted."
                         );
                     }
                 }
             }
         }
+
+        visibility_extender.stop().await;
 
         if self.state.delete_message && can_delete_original {
             let entry = DeleteMessageBatchRequestEntry::builder()
@@ -791,7 +858,7 @@ impl S3Worker {
                 Ok(entry) => {
                     match self.delete_messages(vec![entry]).await {
                         Ok(output) => {
-                            let failed_entries = output.failed.as_ref().map_or(0, Vec::len);
+                            let failed_entries = output.failed.len();
                             if failed_entries > 0 {
                                 tracing::error!(
                                     message_id = %message_id,
@@ -1023,6 +1090,7 @@ impl S3Worker {
                 }
             }
         }
+        drop(stream);
 
         let deferred_body = if deferred_files.is_empty() {
             None
@@ -1046,12 +1114,12 @@ impl S3Worker {
         } else {
             Some(
                 serde_json::to_string(&CrowdStrikeFdrEvent {
-                    cid: base_event.cid,
+                    cid: base_event.cid.clone(),
                     timestamp: base_event.timestamp,
                     file_count: base_event.file_count,
                     total_size: base_event.total_size,
-                    bucket: base_event.bucket,
-                    path_prefix: base_event.path_prefix,
+                    bucket: base_event.bucket.clone(),
+                    path_prefix: base_event.path_prefix.clone(),
                     files: failed_files,
                 })
                 .context(SerializePartialMessageSnafu)?,
@@ -1146,15 +1214,9 @@ impl S3Worker {
             {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    if let ProcessingError::PipelineSend {
-                        source: SendError::Closed,
-                        ..
-                    } = &err
-                    {
-                        return Err(err);
-                    }
+                    let retryable_before_pipeline_send = matches!(err, ProcessingError::GetObject { .. });
 
-                    if attempts > max_retries {
+                    if !retryable_before_pipeline_send || attempts > max_retries {
                         return Err(err);
                     }
 
@@ -1231,8 +1293,6 @@ impl S3Worker {
             &metadata,
             timestamp,
         );
-        
-        let base_template = template;
 
         let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(self.acknowledgements);
 
@@ -1250,24 +1310,28 @@ impl S3Worker {
         let read_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let read_error_capture = Arc::clone(&read_error);
         let parse_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let parse_error_for_take = Arc::clone(&parse_error);
         let uncompressed_tracker = Arc::new(AtomicUsize::new(0));
+        let abort_download = Arc::new(AtomicBool::new(false));
 
+        let scan_abort = Arc::clone(&abort_download);
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
-            FramedRead::new(buffered_reader, self.state.decoder.framer.clone())
-                .map(move |res| match res {
-                    Ok(line) => Some(line),
-                    Err(err) => {
-                        if let Ok(mut read_error) = read_error_capture.lock() {
-                            if read_error.is_none() {
-                                *read_error = Some(err.to_string());
-                            }
-                        }
-                        None
+            FramedRead::new(buffered_reader, self.state.decoder.framer.clone()).scan(
+                false,
+                move |stopped_on_read_error, res| {
+                    if *stopped_on_read_error || scan_abort.load(Ordering::Relaxed) {
+                        return ready(None);
                     }
-                })
-                .take_while(|res| ready(res.is_some()))
-                .map(|res| res.expect("stream stopped on first framing error")),
+                    
+                    ready(match res {
+                        Ok(line) => Some(line),
+                        Err(err) => {
+                            *stopped_on_read_error = true;
+                            set_first_error(&read_error_capture, err.to_string());
+                            None
+                        }
+                    })
+                },
+            ),
         );
 
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = match &self.state.multiline {
@@ -1281,51 +1345,55 @@ impl S3Worker {
             None => lines,
         };
 
-        let events_received = self.events_received.clone();
         let decoder = self.state.decoder.clone();
         let parse_chunk_size = self.state.parse_chunk_size;
         let parse_concurrency_per_file = self.state.parse_concurrency_per_file;
-
         let bytes_received = self.bytes_received.clone();
-        let tracker_clone = Arc::clone(&uncompressed_tracker);
-        let parse_error_capture = Arc::clone(&parse_error);
+        let stream_parse_error = Arc::clone(&parse_error);
+        let stream_uncompressed_tracker = Arc::clone(&uncompressed_tracker);
+        let stream_abort_download = Arc::clone(&abort_download);
 
         let mut stream = lines
-            .chunks(parse_chunk_size)
-            .take_while(move |_| {
-                let has_error = parse_error_for_take.lock().ok().map_or(false, |g| g.is_some());
-                ready(!has_error)
-            })
+            .ready_chunks(parse_chunk_size)
             .map(move |chunk| {
                 let decoder = decoder.clone();
                 let batch = batch.clone();
-                let base_template = base_template.clone();
+                let base_template = template.clone();
                 let bytes_received = bytes_received.clone();
-                let tracker_clone = tracker_clone.clone();
-                let parse_error_capture = Arc::clone(&parse_error_capture);
+                let parse_error = Arc::clone(&stream_parse_error);
+                let uncompressed_tracker = Arc::clone(&stream_uncompressed_tracker);
+                let abort_for_blocking = Arc::clone(&stream_abort_download);
 
                 async move {
+                    let parse_error_for_blocking = Arc::clone(&parse_error);
+
                     let (mut chunk_events, chunk_bytes) = match tokio::task::spawn_blocking(move || {
-                        if parse_error_capture.lock().ok().map_or(false, |g| g.is_some()) {
+                        if has_error(&parse_error_for_blocking) {
+                            abort_for_blocking.store(true, Ordering::Relaxed);
                             return (Vec::new(), 0);
                         }
 
-                        let mut chunk_events =
-                            Vec::with_capacity(chunk.len().saturating_mul(2));
-
-                        let batch_opt = Some(batch);
+                        let mut chunk_events = Vec::with_capacity(chunk.len().saturating_mul(2));
                         let mut chunk_bytes = 0;
 
                         for line in chunk {
                             chunk_bytes += line.len();
+
                             match decoder.deserializer_parse(line) {
                                 Ok((parsed_events, _)) => {
                                     for mut event in parsed_events {
-                                        event = event.with_batch_notifier_option(&batch_opt);
+                                        event = event.with_batch_notifier_option(&batch);
 
                                         if let Some(event_log) = event.maybe_as_log_mut() {
-                                            for (k, v) in base_template.all_fields() {
-                                                event_log.insert(k.clone(), v.clone());
+                                            event_log.metadata_mut().merge(base_template.metadata().clone());
+
+                                            if let Some(fields) = base_template.all_event_fields() {
+                                                for (key, value) in fields {
+                                                    event_log.insert(
+                                                        (PathPrefix::Event, path!(key.as_str())),
+                                                        value.clone(),
+                                                    );
+                                                }
                                             }
                                         }
 
@@ -1333,11 +1401,8 @@ impl S3Worker {
                                     }
                                 }
                                 Err(err) => {
-                                    if let Ok(mut parse_error) = parse_error_capture.lock() {
-                                        if parse_error.is_none() {
-                                            *parse_error = Some(err.to_string());
-                                        }
-                                    }
+                                    set_first_error(&parse_error_for_blocking, err.to_string());
+                                    abort_for_blocking.store(true, Ordering::Relaxed);
                                     break;
                                 }
                             }
@@ -1349,43 +1414,25 @@ impl S3Worker {
                     {
                         Ok(result) => result,
                         Err(err) => {
-                            if let Ok(mut parse_error) = parse_error_capture.lock() {
-                                if parse_error.is_none() {
-                                    *parse_error = Some(err.to_string());
-                                }
-                            }
+                            set_first_error(&parse_error, err.to_string());
                             (Vec::new(), 0)
                         }
                     };
 
-                    if parse_error_capture.lock().ok().map_or(false, |g| g.is_some()) {
+                    if has_error(&parse_error) {
                         chunk_events.clear();
                     }
 
-                    tracker_clone.fetch_add(chunk_bytes, Ordering::Relaxed);
+                    uncompressed_tracker.fetch_add(chunk_bytes, Ordering::Relaxed);
                     bytes_received.emit(ByteSize(chunk_bytes));
 
                     chunk_events
                 }
             })
             .buffered(parse_concurrency_per_file)
-            .flat_map(move |events| {
-                let total_events = events.len();
-                
-                if total_events > 0 {
-                    // Aggregate the estimated sizes
-                    let total_bytes: usize = events
-                        .iter()
-                        .map(|e| e.estimated_json_encoded_size_of())
-                        .sum();
-                        
-                    // Emit once per chunk instead of per event
-                    events_received.emit(CountByteSize(total_events, total_bytes));
-                }
+            .flat_map(futures::stream::iter)
+            .boxed();
 
-                futures::stream::iter(events)
-            });
-        
         let send_error = match self.out.send_event_stream(&mut stream).await {
             Ok(_) => None,
             Err(SendError::Closed) => {
@@ -1398,8 +1445,8 @@ impl S3Worker {
 
         drop(stream);
 
-        let read_error = read_error.lock().ok().and_then(|mut error| error.take());
-        let parse_error = parse_error.lock().ok().and_then(|mut error| error.take());
+        let read_error = take_error(&read_error);
+        let parse_error = take_error(&parse_error);
 
         if read_error.is_some() || parse_error.is_some() || send_error.is_some() {
             emit!(S3ObjectProcessingFailed {
@@ -1513,6 +1560,30 @@ impl S3Worker {
             .send()
             .await
     }
+}
+
+fn set_first_error(error_slot: &Arc<Mutex<Option<String>>>, error: impl Into<String>) {
+    let mut slot = error_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if slot.is_none() {
+        *slot = Some(error.into());
+    }
+}
+
+fn has_error(error_slot: &Arc<Mutex<Option<String>>>) -> bool {
+    error_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+}
+
+fn take_error(error_slot: &Arc<Mutex<Option<String>>>) -> Option<String> {
+    error_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
 }
 
 fn populate_template_metadata(
