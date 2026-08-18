@@ -124,6 +124,7 @@ pub(super) struct Config {
     #[derivative(Default(value = "default_visibility_timeout_secs()"))]
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[configurable(metadata(docs::human_name = "Visibility Timeout"))]
+    #[configurable(validation(range(min = 0, max = 43200)))]
     pub(super) visibility_timeout_secs: u32,
 
     /// Whether successfully handled original SQS messages should be deleted from the queue.
@@ -428,6 +429,14 @@ impl SqsPoller {
 
         tracing::info!("SQS ingestor poller started. Ready to poll for new messages.");
 
+        /*
+         * Phase 1:
+         * Poll SQS until Vector shutdown is requested.
+         *
+         * Once shutdown is observed here, no additional ReceiveMessage calls are made.
+         * Messages that have already been received are owned by worker tasks and must
+         * be drained to completion.
+         */
         loop {
             while let Some(result) = self.tasks.try_join_next() {
                 self.handle_join_result(result);
@@ -435,13 +444,21 @@ impl SqsPoller {
 
             let first_permit = select! {
                 _ = &mut shutdown => {
-                    tracing::info!("Shutdown signal received for SQS poller. Stopping receive loop.");
+                    tracing::info!(
+                        in_flight_tasks = self.tasks.len(),
+                        "Shutdown signal received for SQS poller. Stopping SQS receive loop and entering drain phase."
+                    );
                     break;
                 }
                 permit = self.state.sqs_message_semaphore.clone().acquire_owned() => {
                     match permit {
                         Ok(permit) => permit,
-                        Err(_) => break,
+                        Err(_) => {
+                            tracing::info!(
+                                "SQS message semaphore closed. Stopping SQS receive loop and entering drain phase."
+                            );
+                            break;
+                        }
                     }
                 }
             };
@@ -461,7 +478,9 @@ impl SqsPoller {
             let messages = select! {
                 _ = &mut shutdown => {
                     drop(acquired_permits);
-                    tracing::info!("Shutdown signal received before SQS receive completed.");
+                    tracing::info!(
+                        "Shutdown signal received before next SQS receive completed. No additional SQS messages will be accepted."
+                    );
                     break;
                 }
                 result = Self::receive_messages(Arc::clone(&self.state), receive_count) => {
@@ -489,7 +508,12 @@ impl SqsPoller {
                             );
 
                             select! {
-                                _ = &mut shutdown => break,
+                                _ = &mut shutdown => {
+                                    tracing::info!(
+                                        "Shutdown signal received during SQS receive retry backoff. Entering drain phase."
+                                    );
+                                    break;
+                                }
                                 _ = tokio::time::sleep(delay) => {}
                             }
 
@@ -512,23 +536,32 @@ impl SqsPoller {
             }
         }
 
+        /*
+         * Phase 2:
+         * Drain everything already accepted from SQS.
+         *
+         * Worker tasks must:
+         * - finish all files in the accepted SQS message
+         * - continue extending SQS visibility
+         * - wait for downstream acknowledgements
+         * - delete or explicitly requeue the SQS message
+         */
         tracing::info!(
             in_flight_tasks = self.tasks.len(),
-            "SQS poller stopped receiving. Waiting for in-flight SQS message tasks to finish."
+            "SQS poller stopped receiving. Draining in-flight SQS message tasks."
         );
 
         while let Some(result) = self.tasks.join_next().await {
             self.handle_join_result(result);
         }
 
-        tracing::info!("SQS ingestor poller stopped.");
+        tracing::info!("SQS ingestor poller stopped after draining in-flight SQS message tasks.");
     }
 
     fn spawn_worker(&mut self, message: Message, permit: OwnedSemaphorePermit) {
         let mut worker = S3Worker {
             state: Arc::clone(&self.state),
             out: self.out.clone(),
-            shutdown: self.shutdown.clone(),
             acknowledgements: self.acknowledgements,
             log_namespace: self.log_namespace,
             bytes_received: self.bytes_received.clone(),
@@ -576,7 +609,6 @@ impl SqsPoller {
 struct S3Worker {
     state: Arc<State>,
     out: SourceSender,
-    shutdown: ShutdownSignal,
     acknowledgements: bool,
     log_namespace: LogNamespace,
     bytes_received: Registered<BytesReceived>,
@@ -587,13 +619,16 @@ struct VisibilityExtender {
     task: JoinHandle<()>,
 }
 
+impl Drop for VisibilityExtender {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl VisibilityExtender {
-    fn spawn(
-        state: Arc<State>,
-        receipt_handle: String,
-        shutdown: ShutdownSignal,
-    ) -> VisibilityExtender {
+    fn spawn(state: Arc<State>, receipt_handle: String) -> VisibilityExtender {
         let (stop_tx, mut stop_rx) = watch::channel(false);
+
         let task = tokio::spawn(async move {
             if state.visibility_timeout_secs <= 0 {
                 return;
@@ -601,12 +636,9 @@ impl VisibilityExtender {
 
             let visibility_timeout_secs = state.visibility_timeout_secs;
             let extend_interval = Duration::from_secs((visibility_timeout_secs as u64 / 2).max(1));
-            let shutdown = shutdown.fuse();
-            pin!(shutdown);
 
             loop {
                 select! {
-                    _ = &mut shutdown => break,
                     changed = stop_rx.changed() => {
                         match changed {
                             Ok(()) if *stop_rx.borrow() => break,
@@ -707,10 +739,9 @@ impl S3Worker {
         let visibility_extender = VisibilityExtender::spawn(
             Arc::clone(&self.state),
             receipt_handle.clone(),
-            self.shutdown.clone(),
         );
 
-        let (mut can_delete_original, deferred_body, requeue_body) = match self.handle_sqs_message(message, retry_count).await {
+        let (mut can_delete_original, mut deferred_body, mut requeue_body) = match self.handle_sqs_message(message, retry_count).await {
             Ok(result) => {
                 emit!(SqsMessageProcessingSucceeded {
                     message_id: &message_id
@@ -722,9 +753,44 @@ impl S3Worker {
                     message_id: &message_id,
                     error: &err,
                 });
-                (true, None, Some(original_body))
+
+                let is_unrecoverable = matches!(
+                    err,
+                    ProcessingError::InvalidSqsMessage { .. } | ProcessingError::SerializePartialMessage { .. }
+                );
+
+                let requeue = if is_unrecoverable {
+                    None // Poison pills should not be requeued, simply dropped.
+                } else {
+                    Some(original_body)
+                };
+                
+                (is_unrecoverable, None, requeue)
             }
         };
+
+        // Enforce the 256KB AWS payload size limit to prevent redelivery loop failures
+        if let Some(body) = &deferred_body {
+            if body.len() > 262144 {
+                tracing::error!(
+                    message_id = %message_id,
+                    "Deferred SQS body exceeds 256KB limit. Discarding to prevent infinite queue loop."
+                );
+                can_delete_original = false;
+                deferred_body = None;
+            }
+        }
+
+        if let Some(body) = &requeue_body {
+            if body.len() > 262144 {
+                tracing::error!(
+                    message_id = %message_id, 
+                    "Requeue SQS body exceeds 256KB limit. Discarding to prevent infinite queue loop."
+                );
+                can_delete_original = false;
+                requeue_body = None;
+            }
+        }
 
         if let Some(body) = deferred_body {
             if let Some(deferred) = &self.state.deferred {
@@ -991,6 +1057,14 @@ impl S3Worker {
                     .await
                 {
                     Ok(()) => RecordStatus::Success,
+                    Err(ProcessingError::WrongRegion { region: r, .. }) => {
+                        tracing::warn!("S3 file is from the wrong region (expected {}, got {})", process.state.region.as_ref(), r);
+                        RecordStatus::Failed(record, ProcessingError::WrongRegion {
+                            region: r,
+                            bucket: record.s3.bucket.name.clone(),
+                            key: record.s3.object.key.clone(),
+                        })
+                    }
                     Err(ProcessingError::FileTooOld { .. }) => RecordStatus::Deferred(record),
                     Err(err) => RecordStatus::Failed(record, err),
                 }
@@ -1070,6 +1144,14 @@ impl S3Worker {
                     .await
                 {
                     Ok(()) => RecordStatus::Success,
+                    Err(ProcessingError::WrongRegion { region: r, .. }) => {
+                        tracing::warn!("CrowdStrike file is from the wrong region (expected {}, got {})", process.state.region.as_ref(), r);
+                        RecordStatus::Failed(file, ProcessingError::WrongRegion {
+                            region: r,
+                            bucket: base_event.bucket.clone(),
+                            key: file.path.clone(),
+                        })
+                    }
                     Err(ProcessingError::FileTooOld { .. }) => RecordStatus::Deferred(file),
                     Err(err) => RecordStatus::Failed(file, err),
                 }
@@ -1157,8 +1239,9 @@ impl S3Worker {
         if let Some(deferred) = &self.state.deferred {
             if let Some(time) = event_time {
                 let delta = Utc::now() - time;
+                let age_secs = u64::try_from(delta.num_seconds()).unwrap_or(0);
 
-                if delta.num_seconds() > deferred.max_age_secs as i64 {
+                if age_secs > deferred.max_age_secs {
                     return Err(ProcessingError::FileTooOld {
                         bucket,
                         key,
@@ -1168,30 +1251,17 @@ impl S3Worker {
             }
         }
 
-        let shutdown = self.shutdown.clone().fuse();
-        pin!(shutdown);
-
-        let _file_permit = select! {
-            _ = &mut shutdown => {
-                return Err(ProcessingError::ErrorAcknowledgement {
-                    region: actual_region,
-                    bucket,
-                    key,
-                });
-            }
-            permit = self.state.file_semaphore.clone().acquire_owned() => {
-                match permit {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        return Err(ProcessingError::ErrorAcknowledgement {
-                            region: actual_region,
-                            bucket,
-                            key,
-                        });
-                    }
-                }
-            }
-        };
+        let _file_permit = self
+            .state
+            .file_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ProcessingError::ErrorAcknowledgement {
+                region: actual_region.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+            })?;
 
         let mut backoff = ExponentialBackoff::default().max_delay(Duration::from_secs(10));
         let max_retries = 3;
@@ -1221,13 +1291,7 @@ impl S3Worker {
                     }
 
                     let delay = backoff.next().unwrap_or(Duration::from_secs(10));
-
-                    select! {
-                        _ = self.shutdown.clone().fuse() => {
-                            return Err(err);
-                        }
-                        _ = tokio::time::sleep(delay) => {}
-                    }
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -1353,12 +1417,21 @@ impl S3Worker {
         let stream_uncompressed_tracker = Arc::clone(&uncompressed_tracker);
         let stream_abort_download = Arc::clone(&abort_download);
 
+        // Pre-extract metadata fields to avoid repeated iterations inside spawn_blocking
+        let base_metadata = template.metadata().clone();
+        let base_fields: Vec<_> = if let Some(fields) = template.all_event_fields() {
+            fields.map(|(k, v)| (k.clone(), v.clone())).collect()
+        } else {
+            Vec::new()
+        };
+
         let mut stream = lines
             .ready_chunks(parse_chunk_size)
             .map(move |chunk| {
                 let decoder = decoder.clone();
                 let batch = batch.clone();
-                let base_template = template.clone();
+                let base_metadata = base_metadata.clone();
+                let base_fields = base_fields.clone();
                 let bytes_received = bytes_received.clone();
                 let parse_error = Arc::clone(&stream_parse_error);
                 let uncompressed_tracker = Arc::clone(&stream_uncompressed_tracker);
@@ -1385,15 +1458,13 @@ impl S3Worker {
                                         event = event.with_batch_notifier_option(&batch);
 
                                         if let Some(event_log) = event.maybe_as_log_mut() {
-                                            event_log.metadata_mut().merge(base_template.metadata().clone());
+                                            event_log.metadata_mut().merge(base_metadata.clone());
 
-                                            if let Some(fields) = base_template.all_event_fields() {
-                                                for (key, value) in fields {
-                                                    event_log.insert(
-                                                        (PathPrefix::Event, path!(key.as_str())),
-                                                        value.clone(),
-                                                    );
-                                                }
+                                            for (key, value) in &base_fields {
+                                                event_log.insert(
+                                                    (PathPrefix::Event, path!(key.as_str())),
+                                                    value.clone(),
+                                                );
                                             }
                                         }
 
