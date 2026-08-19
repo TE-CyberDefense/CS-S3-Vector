@@ -616,12 +616,14 @@ struct S3Worker {
 
 struct VisibilityExtender {
     stop_tx: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl Drop for VisibilityExtender {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -665,13 +667,18 @@ impl VisibilityExtender {
             }
         });
 
-        VisibilityExtender { stop_tx, task }
+        VisibilityExtender {
+            stop_tx,
+            task: Some(task),
+        }
     }
 
-    async fn stop(self) {
+    async fn stop(mut self) {
         let _ = self.stop_tx.send(true);
 
-        if let Err(err) = self.task.await {
+        if let Some(task) = self.task.take()
+            && let Err(err) = task.await
+        {
             if err.is_panic() {
                 panic::resume_unwind(err.into_panic());
             }
@@ -1058,11 +1065,14 @@ impl S3Worker {
                 {
                     Ok(()) => RecordStatus::Success,
                     Err(ProcessingError::WrongRegion { region: r, .. }) => {
+                        let bucket = record.s3.bucket.name.clone();
+                        let key = record.s3.object.key.clone();
+
                         tracing::warn!("S3 file is from the wrong region (expected {}, got {})", process.state.region.as_ref(), r);
                         RecordStatus::Failed(record, ProcessingError::WrongRegion {
                             region: r,
-                            bucket: record.s3.bucket.name.clone(),
-                            key: record.s3.object.key.clone(),
+                            bucket,
+                            key,
                         })
                     }
                     Err(ProcessingError::FileTooOld { .. }) => RecordStatus::Deferred(record),
@@ -1129,6 +1139,7 @@ impl S3Worker {
         let futures = fdr_event.files.into_iter().map(|file| {
             let mut process = self.clone();
             let bucket = base_event.bucket.clone();
+            let error_bucket = bucket.clone();
 
             async move {
                 match process
@@ -1145,11 +1156,13 @@ impl S3Worker {
                 {
                     Ok(()) => RecordStatus::Success,
                     Err(ProcessingError::WrongRegion { region: r, .. }) => {
+                        let key = file.path.clone();
+
                         tracing::warn!("CrowdStrike file is from the wrong region (expected {}, got {})", process.state.region.as_ref(), r);
                         RecordStatus::Failed(file, ProcessingError::WrongRegion {
                             region: r,
-                            bucket: base_event.bucket.clone(),
-                            key: file.path.clone(),
+                            bucket: error_bucket,
+                            key,
                         })
                     }
                     Err(ProcessingError::FileTooOld { .. }) => RecordStatus::Deferred(file),
