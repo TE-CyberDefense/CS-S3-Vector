@@ -559,12 +559,18 @@ impl SqsPoller {
     }
 
     fn spawn_worker(&mut self, message: Message, permit: OwnedSemaphorePermit) {
+        let completed_files = Arc::new(AtomicUsize::new(0));
+        let files_in_message = Arc::new(AtomicUsize::new(0));
+        let parsed_events = Arc::new(AtomicUsize::new(0));
         let mut worker = S3Worker {
             state: Arc::clone(&self.state),
             out: self.out.clone(),
             acknowledgements: self.acknowledgements,
             log_namespace: self.log_namespace,
             bytes_received: self.bytes_received.clone(),
+            completed_files,
+            files_in_message,
+            parsed_events,
         };
 
         self.tasks.spawn(
@@ -612,6 +618,9 @@ struct S3Worker {
     acknowledgements: bool,
     log_namespace: LogNamespace,
     bytes_received: Registered<BytesReceived>,
+    completed_files: Arc<AtomicUsize>,
+    files_in_message: Arc<AtomicUsize>,
+    parsed_events: Arc<AtomicUsize>,
 }
 
 struct VisibilityExtender {
@@ -706,6 +715,7 @@ async fn change_message_visibility(
 
 impl S3Worker {
     async fn process_message(&mut self, message: Message) {
+        let message_start = Instant::now();
         let receipt_handle = match message.receipt_handle.as_ref() {
             None => {
                 tracing::warn!(
@@ -959,6 +969,15 @@ impl S3Worker {
                 }
             }
         }
+
+        tracing::info!(
+            message_id = %message_id,
+            duration_ms = message_start.elapsed().as_millis() as u64,
+            files_in_message = self.files_in_message.load(Ordering::Relaxed),
+            completed_files = self.completed_files.load(Ordering::Relaxed),
+            parsed_events = self.parsed_events.load(Ordering::Relaxed),
+            "Finished processing SQS message."
+        );
     }
 
     async fn handle_sqs_message(
@@ -1027,6 +1046,7 @@ impl S3Worker {
 
         let futures = s3_event.records.into_iter().map(|record| {
             let mut process = self.clone();
+            process.files_in_message.fetch_add(1, Ordering::Relaxed);
 
             async move {
                 let event_version: semver::Version = record.event_version.clone().into();
@@ -1138,6 +1158,7 @@ impl S3Worker {
 
         let futures = fdr_event.files.into_iter().map(|file| {
             let mut process = self.clone();
+            process.files_in_message.fetch_add(1, Ordering::Relaxed);
             let bucket = base_event.bucket.clone();
             let error_bucket = bucket.clone();
 
@@ -1388,6 +1409,7 @@ impl S3Worker {
         let read_error_capture = Arc::clone(&read_error);
         let parse_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let uncompressed_tracker = Arc::new(AtomicUsize::new(0));
+        let file_event_count = Arc::new(AtomicUsize::new(0));
         let abort_download = Arc::new(AtomicBool::new(false));
 
         let scan_abort = Arc::clone(&abort_download);
@@ -1429,6 +1451,8 @@ impl S3Worker {
         let stream_parse_error = Arc::clone(&parse_error);
         let stream_uncompressed_tracker = Arc::clone(&uncompressed_tracker);
         let stream_abort_download = Arc::clone(&abort_download);
+        let stream_file_event_count = Arc::clone(&file_event_count);
+        let stream_parsed_events = Arc::clone(&self.parsed_events);
 
         // Pre-extract metadata fields to avoid repeated iterations inside spawn_blocking
         let base_metadata = template.metadata().clone();
@@ -1449,6 +1473,8 @@ impl S3Worker {
                 let parse_error = Arc::clone(&stream_parse_error);
                 let uncompressed_tracker = Arc::clone(&stream_uncompressed_tracker);
                 let abort_for_blocking = Arc::clone(&stream_abort_download);
+                let file_event_count = Arc::clone(&stream_file_event_count);
+                let parsed_events = Arc::clone(&stream_parsed_events);
 
                 async move {
                     let parse_error_for_blocking = Arc::clone(&parse_error);
@@ -1466,8 +1492,12 @@ impl S3Worker {
                             chunk_bytes += line.len();
 
                             match decoder.deserializer_parse(line) {
-                                Ok((parsed_events, _)) => {
-                                    for mut event in parsed_events {
+                                Ok((parsed_event_batch, _)) => {
+                                    let parsed_event_count = parsed_event_batch.len();
+                                    file_event_count.fetch_add(parsed_event_count, Ordering::Relaxed);
+                                    parsed_events.fetch_add(parsed_event_count, Ordering::Relaxed);
+
+                                    for mut event in parsed_event_batch {
                                         event = event.with_batch_notifier_option(&batch);
 
                                         if let Some(event_log) = event.maybe_as_log_mut() {
@@ -1573,9 +1603,12 @@ impl S3Worker {
         } else {
             match receiver {
                 None => {
+                    self.completed_files.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(
                         %bucket,
                         %key,
+                        duration_ms = download_start.elapsed().as_millis() as u64,
+                        messages = file_event_count.load(Ordering::Relaxed),
                         compressed_size_bytes = compressed_size,
                         uncompressed_size_bytes = uncompressed_total,
                         compression_ratio = format!("{:.2}:1", compression_ratio),
@@ -1586,9 +1619,12 @@ impl S3Worker {
                 }
                 Some(receiver) => match receiver.await {
                     BatchStatus::Delivered => {
+                        self.completed_files.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(
                             %bucket,
                             %key,
+                            duration_ms = download_start.elapsed().as_millis() as u64,
+                            messages = file_event_count.load(Ordering::Relaxed),
                             compressed_size_bytes = compressed_size,
                             uncompressed_size_bytes = uncompressed_total,
                             compression_ratio = format!("{:.2}:1", compression_ratio),
