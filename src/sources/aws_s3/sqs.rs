@@ -1021,11 +1021,17 @@ impl S3Worker {
                     .timestamp
                     .and_then(|ts| Utc.timestamp_millis_opt(ts).single().map(|t| t.to_rfc3339()))
                     .unwrap_or_else(|| "unknown".to_string());
+                let total_size = fdr_event
+                    .total_size
+                    .map_or_else(|| "unknown".to_string(), |size| size.to_string());
+                let file_count = fdr_event
+                    .file_count
+                    .map_or_else(|| "unknown".to_string(), |count| count.to_string());
 
                 tracing::info!(
-                    message_id = ?message.message_id,
-                    total_size = ?fdr_event.total_size,
-                    file_count = ?fdr_event.file_count,
+                    message_id = %message.message_id.as_deref().unwrap_or("unknown"),
+                    total_size = %total_size,
+                    file_count = %file_count,
                     timestamp = %timestamp_human,
                     "CrowdStrike FDR event details"
                 );
