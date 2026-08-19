@@ -175,7 +175,7 @@ impl InternalEvent for GotHttpWarning<'_> {
     fn emit(self) {
         warn!(
             message = "HTTP error.",
-            error = %self.error,
+            error = ?self.error,
             error_type = error_type::REQUEST_FAILED,
             stage = error_stage::PROCESSING,
         );
